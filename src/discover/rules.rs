@@ -660,6 +660,15 @@ pub const RULES: &[RtkRule] = &[
         subcmd_status: &[],
     },
     RtkRule {
+        pattern: r"^mysql(\s|$)",
+        rtk_cmd: "rtk mysql",
+        rewrite_prefixes: &["mysql"],
+        category: "Infra",
+        savings_pct: 75.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
         pattern: r"^psql(\s|$)",
         rtk_cmd: "rtk psql",
         rewrite_prefixes: &["psql"],
