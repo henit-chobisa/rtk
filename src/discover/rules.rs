@@ -664,7 +664,7 @@ pub const RULES: &[RtkRule] = &[
         rtk_cmd: "rtk mysql",
         rewrite_prefixes: &["mysql"],
         category: "Infra",
-        savings_pct: 75.0,
+        savings_pct: 60.0,
         subcmd_savings: &[],
         subcmd_status: &[],
     },
