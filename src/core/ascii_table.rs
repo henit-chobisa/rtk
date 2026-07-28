@@ -25,8 +25,8 @@
 //! ```
 
 use crate::core::truncate::CAP_LIST;
-use lazy_static::lazy_static;
 use regex::Regex;
+use std::sync::LazyLock;
 
 /// Column junction character in the border row (`----+----`). The paired cell
 /// separator is [`SEPARATOR`]. Both follow the near-universal ASCII box-table
@@ -36,9 +36,7 @@ const JUNCTION: char = '+';
 /// Cell separator character in data rows (`| a | b |`).
 const SEPARATOR: u8 = b'|';
 
-lazy_static! {
-    static ref BORDER: Regex = Regex::new(r"^[-+]+$").unwrap();
-}
+static BORDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[-+]+$").unwrap());
 
 pub struct TableShape {
     /// Rows are wrapped in outer bars (`| a | b |`) as in mysql. psql tables

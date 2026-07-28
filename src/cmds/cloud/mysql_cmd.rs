@@ -37,18 +37,16 @@ use crate::core::ascii_table::{strip_ascii_table, TableShape};
 use crate::core::runner::{self, RunOptions};
 use crate::core::utils::resolved_command;
 use anyhow::Result;
-use lazy_static::lazy_static;
 use regex::Regex;
+use std::sync::LazyLock;
 
-lazy_static! {
-    /// A mysql box-table border: `+----+------+` (starts and ends with `+`).
-    static ref TABLE_BORDER: Regex = Regex::new(r"^\+[-+]+\+$").unwrap();
-    /// The timing footer shared by every mysql status line:
-    /// `N rows in set (0.00 sec)`, `Empty set (0.00 sec)`,
-    /// `Query OK, N rows affected (0.00 sec)`, `... 1 warning (0.00 sec)`.
-    /// Also tolerates a comma decimal separator in localized builds.
-    static ref FOOTER: Regex = Regex::new(r"\(\d+[.,]\d+ sec\)").unwrap();
-}
+/// A mysql box-table border: `+----+------+` (starts and ends with `+`).
+static TABLE_BORDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\+[-+]+\+$").unwrap());
+/// The timing footer shared by every mysql status line:
+/// `N rows in set (0.00 sec)`, `Empty set (0.00 sec)`,
+/// `Query OK, N rows affected (0.00 sec)`, `... 1 warning (0.00 sec)`.
+/// Also tolerates a comma decimal separator in localized builds.
+static FOOTER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\(\d+[.,]\d+ sec\)").unwrap());
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     let mut cmd = resolved_command("mysql");

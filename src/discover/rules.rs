@@ -653,8 +653,7 @@ pub const RULES: &[RtkRule] = &[
         rewrite_prefixes: &["mysql"],
         category: "Infra",
         savings_pct: 60.0,
-        subcmd_savings: &[],
-        subcmd_status: &[],
+        ..RtkRule::DEFAULT
     },
     RtkRule {
         pattern: r"^psql(\s|$)",
