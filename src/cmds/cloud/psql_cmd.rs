@@ -15,7 +15,6 @@ const MAX_EXPANDED_RECORDS: usize = CAP_LIST;
 
 static EXPANDED_RECORD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"-\[ RECORD \d+ \]-").unwrap());
-static SEPARATOR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[-+]+$").unwrap());
 static ROW_COUNT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\(\d+ rows?\)$").unwrap());
 static RECORD_HEADER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^-\[ RECORD (\d+) \]-").unwrap());
