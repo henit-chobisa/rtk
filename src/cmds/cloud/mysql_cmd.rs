@@ -46,7 +46,11 @@ static TABLE_BORDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\+[-+]+\+$
 /// `N rows in set (0.00 sec)`, `Empty set (0.00 sec)`,
 /// `Query OK, N rows affected (0.00 sec)`, `... 1 warning (0.00 sec)`.
 /// Also tolerates a comma decimal separator in localized builds.
-static FOOTER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\(\d+[.,]\d+ sec\)").unwrap());
+///
+/// Anchored to end-of-line: mysql always closes the status line with the timing
+/// parenthesis, so an unanchored match would also swallow unrelated lines that
+/// merely *mention* a duration.
+static FOOTER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\(\d+[.,]\d+ sec\)$").unwrap());
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     let mut cmd = resolved_command("mysql");
@@ -116,12 +120,23 @@ fn is_table_format(output: &str) -> bool {
     output.lines().any(|line| TABLE_BORDER.is_match(line.trim()))
 }
 
+/// Is this line the trailing `N rows in set (0.00 sec)` status line?
+///
+/// A cell value can legitimately contain a `(N.NN sec)`-shaped substring, so
+/// matching the timing pattern alone would silently delete data rows. mysql
+/// wraps every table row in `|` bars and never puts one in a status line, so
+/// the bar is the discriminator.
+fn is_footer_line(line: &str) -> bool {
+    let line = line.trim();
+    !line.contains('|') && FOOTER.is_match(line)
+}
+
 /// Drop the `(N.NN sec)` footer, then hand the rest to the shared ASCII-table
 /// stripper. mysql wraps every row in outer bars, so `has_outer_pipes` is true.
 fn filter_table(output: &str) -> String {
     let body = output
         .lines()
-        .filter(|line| !FOOTER.is_match(line.trim()))
+        .filter(|line| !is_footer_line(line))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -173,6 +188,52 @@ mod tests {
             let out = filter_mysql_output(&input);
             assert!(!out.contains("sec)"), "footer leaked: {}", footer);
         }
+    }
+
+    #[test]
+    fn test_footer_shaped_cell_content_preserved() {
+        // Regression: an unanchored, pipe-blind footer match deleted any data
+        // row whose cell text happened to contain `(N.NN sec)`.
+        let input = "\
++----+------------------------------+
+| id | note                         |
++----+------------------------------+
+|  1 | backup done (12.34 sec) ok   |
+|  2 | second row                   |
++----+------------------------------+
+2 rows in set (0.00 sec)";
+        let out = filter_mysql_output(input);
+        assert_eq!(
+            out,
+            "id\tnote\n1\tbackup done (12.34 sec) ok\n2\tsecond row"
+        );
+        assert!(!out.contains("2 rows in set"));
+    }
+
+    #[test]
+    fn test_footer_shaped_cell_at_row_end_preserved() {
+        // Worst case: the timing substring is the last thing on the line before
+        // the closing bar, so even an end-anchored match must not fire.
+        let input = "\
++----+---------------------+
+| id | note                |
++----+---------------------+
+|  1 | done (12.34 sec)    |
++----+---------------------+
+1 row in set (0.00 sec)";
+        let out = filter_mysql_output(input);
+        assert_eq!(out, "id\tnote\n1\tdone (12.34 sec)");
+    }
+
+    #[test]
+    fn test_is_footer_line() {
+        assert!(is_footer_line("2 rows in set (0.00 sec)"));
+        assert!(is_footer_line("Query OK, 1 row affected (0,01 sec)"));
+        assert!(!is_footer_line("|  1 | backup done (12.34 sec) ok |"));
+        // Mentions a duration but is not a status line.
+        assert!(!is_footer_line(
+            "ERROR 1205 (HY000): Lock wait timeout (51.00 sec) exceeded"
+        ));
     }
 
     #[test]
