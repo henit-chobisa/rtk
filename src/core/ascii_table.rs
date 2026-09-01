@@ -44,13 +44,22 @@ pub struct TableShape {
     pub has_outer_pipes: bool,
 }
 
+/// Byte positions of the column junctions (`+`) in one border row.
+fn junctions_in(border: &str) -> Vec<usize> {
+    border.match_indices(JUNCTION).map(|(i, _)| i).collect()
+}
+
 /// Byte positions of the column junctions (`+`) in the first border row.
 /// Returns `[]` when no `+`-bearing border exists, which disables offset
 /// slicing and falls the caller back to naive splitting.
+///
+/// This only *seeds* the layout: psql prints its header above the first
+/// border, so that row needs offsets before the loop reaches one. Every border
+/// the loop meets re-derives them — see [`strip_ascii_table`].
 fn junction_offsets(body: &str) -> Vec<usize> {
     body.lines()
         .find(|l| BORDER.is_match(l.trim()) && l.contains(JUNCTION))
-        .map(|border| border.match_indices(JUNCTION).map(|(i, _)| i).collect())
+        .map(junctions_in)
         .unwrap_or_default()
 }
 
@@ -106,8 +115,28 @@ fn split_by_offsets(line: &str, junctions: &[usize], has_outer_pipes: bool) -> O
 /// De-decorate an ASCII table body. The first row containing `|` is treated as
 /// the header (always kept); data rows are capped at [`CAP_LIST`], with an
 /// `... +N more rows` marker when truncated.
+///
+/// A body can hold more than one table — a multi-statement query returns one
+/// result set per statement. A border whose junction layout differs from the
+/// current one starts a new table: offsets are re-derived from it, and the
+/// header/cap accounting restarts so the second result set is not counted
+/// against the first one\'s cap. Reusing the first border\'s byte offsets for
+/// every later row is what previously shredded a second, narrower table into
+/// the wrong columns.
+///
+/// Two adjacent tables with *identical* column widths are indistinguishable
+/// here and merge into one. That is harmless: the offsets are correct for
+/// both, so only the row count and the header/data split are affected.
 pub fn strip_ascii_table(body: &str, shape: TableShape) -> String {
-    let junctions = junction_offsets(body);
+    strip_ascii_table_with_stats(body, shape).0
+}
+
+/// [`strip_ascii_table`], additionally reporting how many data rows the cap hid
+/// across every result set in the body. A caller that shows `... +N more rows`
+/// needs the count to decide whether to offer a recovery path for them.
+pub fn strip_ascii_table_with_stats(body: &str, shape: TableShape) -> (String, usize) {
+    let mut junctions = junction_offsets(body);
+    let mut hidden = 0usize;
 
     let mut out: Vec<String> = Vec::new();
     let mut pipe_rows = 0usize; // header + data rows encountered
@@ -122,6 +151,16 @@ pub fn strip_ascii_table(body: &str, shape: TableShape) -> String {
 
         // Skip border lines: `----+----` (psql) and `+----+----+` (mysql).
         if BORDER.is_match(trimmed) {
+            if line.contains(JUNCTION) {
+                let layout = junctions_in(line);
+                if layout != junctions {
+                    // A different column layout means a new result set.
+                    hidden += push_overflow(&mut out, data_rows);
+                    pipe_rows = 0;
+                    data_rows = 0;
+                    junctions = layout;
+                }
+            }
             continue;
         }
 
@@ -136,7 +175,11 @@ pub fn strip_ascii_table(body: &str, shape: TableShape) -> String {
             if is_header || data_rows <= CAP_LIST {
                 let joined = match split_by_offsets(line, &junctions, shape.has_outer_pipes) {
                     Some(cells) => cells.join("\t"),
-                    None => naive_split(trimmed, shape.has_outer_pipes),
+                    None => naive_split(
+                        trimmed,
+                        shape.has_outer_pipes,
+                        column_count(&junctions, shape.has_outer_pipes),
+                    ),
                 };
                 out.push(joined);
             }
@@ -146,24 +189,83 @@ pub fn strip_ascii_table(body: &str, shape: TableShape) -> String {
         }
     }
 
-    if data_rows > CAP_LIST {
-        out.push(format!("... +{} more rows", data_rows - CAP_LIST));
-    }
+    hidden += push_overflow(&mut out, data_rows);
 
-    out.join("\n")
+    (out.join("\n"), hidden)
+}
+
+/// Append the `... +N more rows` marker for a table that hit [`CAP_LIST`],
+/// returning how many rows it hid. Called once per result set, not once per
+/// body.
+fn push_overflow(out: &mut Vec<String>, data_rows: usize) -> usize {
+    if data_rows > CAP_LIST {
+        let hidden = data_rows - CAP_LIST;
+        out.push(format!("... +{} more rows", hidden));
+        hidden
+    } else {
+        0
+    }
+}
+
+/// How many columns the border implies, or `None` when there is no border to
+/// learn it from (a borderless body, where any split is a guess anyway).
+fn column_count(junctions: &[usize], has_outer_pipes: bool) -> Option<usize> {
+    if junctions.is_empty() {
+        return None;
+    }
+    if has_outer_pipes {
+        // The junctions are the bars themselves; columns sit between them.
+        junctions.len().checked_sub(1).filter(|n| *n > 0)
+    } else {
+        // The junctions are interior separators, with an edge on each side.
+        Some(junctions.len() + 1)
+    }
 }
 
 /// Fallback used when the border-offset slice can't apply: split on every `|`.
 /// Correct for borderless tables and unicode rows without interior pipes.
-fn naive_split(trimmed: &str, has_outer_pipes: bool) -> String {
+///
+/// `expected_columns` is the guard. mysql pads to *display* width while the
+/// offsets are counted in bytes, so one wide character in a row is enough to
+/// fail the offset check and land here — and if that row also carries a `|`
+/// inside a cell, splitting on every bar invents columns and silently reports
+/// the wrong data. When the split yields more fields than the border has
+/// columns, the extra bars are content that cannot be placed, so the row is
+/// returned unsplit instead. One visibly-unsplit field is recoverable; wrongly
+/// split fields are not.
+fn naive_split(trimmed: &str, has_outer_pipes: bool, expected_columns: Option<usize>) -> String {
     let cells: Vec<&str> = trimmed.split('|').map(|c| c.trim()).collect();
-    if has_outer_pipes && cells.len() >= 2 {
+    let sliced: &[&str] = if has_outer_pipes && cells.len() > 2 {
         // Drop the empty edge cells produced by the outer bars. Interior empty
         // cells (NULLs) are preserved.
-        cells[1..cells.len() - 1].join("\t")
+        &cells[1..cells.len() - 1]
     } else {
-        cells.join("\t")
+        // Fewer than two bars means the row is malformed (a wrapped cell, a
+        // truncated line). `cells.len() == 2` would slice to nothing and drop
+        // the content entirely, so keep whatever is there.
+        &cells
+    };
+
+    if matches!(expected_columns, Some(expected) if sliced.len() > expected) {
+        return unsplit_row(trimmed, has_outer_pipes);
     }
+
+    sliced.join("\t")
+}
+
+/// The row with its outer bars removed and nothing else touched — used when the
+/// column boundaries cannot be established, so no `\t` is invented.
+fn unsplit_row(trimmed: &str, has_outer_pipes: bool) -> String {
+    if !has_outer_pipes {
+        return trimmed.to_string();
+    }
+    trimmed
+        .strip_prefix('|')
+        .unwrap_or(trimmed)
+        .strip_suffix('|')
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -304,6 +406,193 @@ mod tests {
         assert!(out.contains("... +5 more rows"));
         // header + CAP_LIST data rows + overflow marker
         assert_eq!(out.lines().count(), CAP_LIST + 2);
+    }
+
+    #[test]
+    fn test_second_result_set_keeps_its_own_columns() {
+        // Regression: offsets were derived once from the first border and
+        // reused, so a second, narrower table failed the junction check, fell
+        // to naive_split, and had every interior `|` turned into a column
+        // break. `x|y|z` came out as three columns.
+        let input = "\
++----+-------+
+| id | val   |
++----+-------+
+| 1  | a|b|c |
++----+-------+
++------+---------+
+| k    | pattern |
++------+---------+
+| 1    | x|y|z   |
++------+---------+";
+        let out = strip_ascii_table(
+            input,
+            TableShape {
+                has_outer_pipes: true,
+            },
+        );
+        assert_eq!(out, "id\tval\n1\ta|b|c\nk\tpattern\n1\tx|y|z");
+    }
+
+    #[test]
+    fn test_each_result_set_gets_its_own_cap() {
+        // Regression: the cap was counted across the whole body, so a second
+        // result set after a long first one vanished into the first table's
+        // `... +N more rows`.
+        let mut lines = vec![
+            "+----+-----+".to_string(),
+            "| id | val |".to_string(),
+            "+----+-----+".to_string(),
+        ];
+        for i in 1..=CAP_LIST + 3 {
+            lines.push(format!("| {} | v{} |", i, i));
+        }
+        lines.push("+----+-----+".to_string());
+        lines.push("+------+".to_string());
+        lines.push("| solo |".to_string());
+        lines.push("+------+".to_string());
+        lines.push("| only |".to_string());
+        lines.push("+------+".to_string());
+        let out = strip_ascii_table(
+            &lines.join("\n"),
+            TableShape {
+                has_outer_pipes: true,
+            },
+        );
+
+        // First table truncates and says so, before the second table starts.
+        assert!(out.contains("... +3 more rows"));
+        // The second result set survives in full.
+        assert!(out.contains("solo"), "second table header lost:\n{}", out);
+        assert!(out.contains("only"), "second table row lost:\n{}", out);
+        // ...and the marker sits between the two, not at the very end.
+        let marker = out
+            .lines()
+            .position(|l| l.starts_with("... +"))
+            .expect("marker");
+        let solo = out
+            .lines()
+            .position(|l| l == "solo")
+            .expect("second header");
+        assert!(marker < solo, "marker must close the first table:\n{}", out);
+    }
+
+    #[test]
+    fn test_repeated_border_is_not_a_new_table() {
+        // mysql draws three identical borders per table. Only a *different*
+        // layout starts a new result set, otherwise every table would reset
+        // its own header after the second border.
+        let input = "+----+------+\n| id | name |\n+----+------+\n| 1  | foo  |\n+----+------+";
+        let out = strip_ascii_table(
+            input,
+            TableShape {
+                has_outer_pipes: true,
+            },
+        );
+        assert_eq!(out, "id\tname\n1\tfoo");
+    }
+
+    #[test]
+    fn test_malformed_single_bar_row_keeps_content() {
+        // One interior bar and no outer bars: `cells.len() == 2`, which the old
+        // slice turned into an empty string — a silent content drop on the path
+        // that exists to be the safe fallback.
+        let out = strip_ascii_table(
+            "1 | 2",
+            TableShape {
+                has_outer_pipes: true,
+            },
+        );
+        assert_eq!(out, "1\t2");
+    }
+
+    #[test]
+    fn test_stats_report_hidden_rows_per_result_set() {
+        // The count drives the caller\'s recovery hint, so it must total every
+        // result set, not just the last one.
+        let mut lines = Vec::new();
+        for (width, extra) in [("+----+", 3usize), ("+------+", 5usize)] {
+            lines.push(width.to_string());
+            lines.push("| id |".to_string());
+            lines.push(width.to_string());
+            for i in 1..=CAP_LIST + extra {
+                lines.push(format!("| {} |", i));
+            }
+            lines.push(width.to_string());
+        }
+        let (text, hidden) = strip_ascii_table_with_stats(
+            &lines.join("\n"),
+            TableShape {
+                has_outer_pipes: true,
+            },
+        );
+        assert_eq!(hidden, 8, "3 hidden in the first table, 5 in the second");
+        assert!(text.contains("... +3 more rows"));
+        assert!(text.contains("... +5 more rows"));
+    }
+
+    #[test]
+    fn test_stats_report_zero_when_nothing_truncated() {
+        let (_, hidden) = strip_ascii_table_with_stats(
+            "+----+\n| id |\n+----+\n|  1 |\n+----+",
+            TableShape {
+                has_outer_pipes: true,
+            },
+        );
+        assert_eq!(hidden, 0);
+    }
+
+    #[test]
+    fn test_wide_char_row_with_pipe_cell_is_not_split_wrongly() {
+        // mysql pads to display width, offsets are counted in bytes, so one
+        // wide character fails the offset check and lands in naive_split. The
+        // cell also holds a `|`, which used to be promoted to a column break:
+        // `a|b☕` came back as two separate fields.
+        let input = "\
++----+--------+
+| id | val    |
++----+--------+
+| 1  | a|b☕  |
++----+--------+";
+        let out = strip_ascii_table(
+            input,
+            TableShape {
+                has_outer_pipes: true,
+            },
+        );
+        let row = out.lines().nth(1).expect("data row");
+        assert!(
+            !row.contains("a\tb"),
+            "cell content was split into columns: {:?}",
+            row
+        );
+        assert!(row.contains("a|b☕"), "cell content lost: {:?}", row);
+    }
+
+    #[test]
+    fn test_wide_char_row_without_interior_pipe_still_splits() {
+        // The guard must not disable the fallback for the ordinary case: no
+        // extra bars, so the split is unambiguous and still happens.
+        let input =
+            "+----+--------+\n| id | name   |\n+----+--------+\n| 1  | café☕ |\n+----+--------+";
+        let out = strip_ascii_table(
+            input,
+            TableShape {
+                has_outer_pipes: true,
+            },
+        );
+        assert_eq!(out, "id\tname\n1\tcafé☕");
+    }
+
+    #[test]
+    fn test_column_count_from_border() {
+        // mysql: junctions are the bars, columns sit between them.
+        assert_eq!(column_count(&[0, 5, 14], true), Some(2));
+        // psql: junctions are interior separators, with an edge each side.
+        assert_eq!(column_count(&[4], false), Some(2));
+        // No border to learn from.
+        assert_eq!(column_count(&[], true), None);
+        assert_eq!(column_count(&[0], true), None);
     }
 
     #[test]
